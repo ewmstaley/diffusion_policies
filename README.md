@@ -1,6 +1,6 @@
 # Diffusion Policies Implementation
 
-This is an implementation of Diffusion Policies which is tested on the CarRacing-v3 environment, and trained from 20 trajectories of a human expert playing the game with a joystick.
+This is a pytorch implementation of [Diffusion Policies](https://diffusion-policy.cs.columbia.edu/) which is tested on the CarRacing-v3 environment, and trained from 20 trajectories of a human expert playing the game with a joystick.
 
 This work was authored by Ted Staley and is Copyright © 2024 The Johns Hopkins University Applied Physics Laboratory LLC, please see the LICENSE file.
 
