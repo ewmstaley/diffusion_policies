@@ -29,5 +29,9 @@ The train.py script takes about 8 hours to run on a 4090 GPU and converges to ne
 
 ### Video of Results:
 
-Here is a brief video of the policy running on an especially exciting track generation: [TODO]
+Here is a brief video of the policy running on an especially exciting track generation:
+
+https://github.com/user-attachments/assets/9138d0b2-52d9-4b95-9871-8d5558e393fb
+
+
 
