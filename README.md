@@ -5,7 +5,9 @@ This is an implementation of Diffusion Policies (DDPM and DDIM), Flow Matching P
 This work was authored by Ted Staley and is Copyright © 2024 The Johns Hopkins University Applied Physics Laboratory LLC, please see the LICENSE file.
 
 Full accompanying notes on this repo and the technique can be found here:
-TODO
+- [Diffusion Notes](https://www.tedstaley.com/posts/diffusion_3/diffusion3.html)
+- [Flow Matching Notes](https://www.tedstaley.com/posts/flow/flow_notes.html)
+- [Shortcut Model Notes](https://www.tedstaley.com/posts/short/shortcut.html)
 
 
 ### Brief Outline of Files
