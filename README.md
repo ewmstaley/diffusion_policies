@@ -37,5 +37,4 @@ Notably, the shortcut model can match this performance even with one-step infere
 
 ![results](./assets/three_animation.gif)
 
-It is possible that the DDIM just had a bad run, since on average it has simialr performance.
 
