@@ -28,42 +28,53 @@ import torch
 import numpy as np
 import cv2
 import math
+import time
 from utility import get_diffusion_parameters
 from tqdm import tqdm
+import copy
 
 
 class DiffusionPolicy():
 
-	def __init__(self, state_shape, action_size, model, state_extractor, time_extractor, device, T=1000,
-		history_size=4, action_sequence_length=16, implicit=True, sampling_factor=20, channels_are_actions=True,
-		clip=None):
+	def __init__(self, state_shape, action_size, model, state_extractor, time_extractor, 
+		device, sampling_algo, step_size_extractor=None,
+		T=1000, history_size=4, action_sequence_length=16, channels_are_actions=True, clip=None, parallel_envs=False):
 
 		self.state_shape = state_shape
 		self.action_size = action_size
 		self.model = model
 		self.state_extractor = state_extractor
 		self.time_extractor = time_extractor
+		self.step_size_extractor = step_size_extractor
 		self.device = device
 
 		self.state_history = []
 		self.current_trajectory = []
+		self.gen_time_history = [] # to record how long it takes, on average, to generate
 
 		self.T = T
 		self.history_size = history_size
 		self.action_sequence_length = action_sequence_length
-		self.implicit = implicit
-		self.time_sampling_factor = sampling_factor
+		self.sampling_algo = sampling_algo
 		self.channels_are_actions = channels_are_actions
-		self.clip = None
+		self.clip = clip
+
+		# are we actually dealing with batches of states?
+		self.parallel_envs = parallel_envs
 
 
 	def reset(self):
 		self.state_history = []
 		self.current_trajectory = []
+		self.gen_time_history = []
 
 
 	def act(self, state):
-		self.state_history.append(state)
+		if not self.parallel_envs:
+			# process a "set of one environments" in parallel
+			state = [state]
+
+		self.state_history.append(copy.deepcopy(state))
 
 		if len(self.current_trajectory)==0:
 
@@ -76,10 +87,20 @@ class DiffusionPolicy():
 				self.state_history = self.state_history[-self.history_size:]
 
 			# make a new trajectory
+			stx = time.time()
 			self.refresh_trajectory()
+			elapsedx = time.time() - stx
+			self.gen_time_history.append(elapsedx)
+		
+		# note: current_trajectory is shape (envs, action_horizon_over_2, action_dim)
+		action = self.current_trajectory[:,0,:]
+		if not self.parallel_envs:
+			action = action[0]
+		self.current_trajectory = self.current_trajectory[:,1:,:]
 
-		action = self.current_trajectory[0]
-		self.current_trajectory = self.current_trajectory[1:]
+		# if second dim is zero, we have exhausted our actions
+		if self.current_trajectory.shape[1] == 0:
+			self.current_trajectory = []
 		return action
 
 
@@ -90,34 +111,39 @@ class DiffusionPolicy():
 		self.time_extractor.eval()
 
 		# get state history as a tensor
-		history = np.stack(self.state_history, axis=-1) # (W, H, ch, hist) or (S, hist)
+		history = np.stack(self.state_history, axis=-1) # (envs, W, H, ch, hist) or (envs, S, hist)
+		E = history.shape[0]
 		if len(self.state_shape)==3:
-			W = history.shape[0]
-			history = np.reshape(history, (W, W, -1))
-			history = np.transpose(history, (2,0,1)) # (ch*hist, W, H)
+			W = history.shape[1]
+			history = np.reshape(history, (E, W, W, -1))
+			history = np.transpose(history, (0,3,1,2)) # (E, ch*hist, W, H)
 		else:
-			history = history.flatten()
+			history = np.reshape(history, (E, -1))
 		history = torch.from_numpy(history).to(torch.float32).to(self.device)
 
 		# get times
-		ts = list(range(self.T))
-		ts = ts[::self.time_sampling_factor][::-1] 
+		ts = self.sampling_algo.ts
+		if self.sampling_algo.reverse_gen:
+			ts = ts[::-1] 
 		ts = torch.as_tensor(ts).to(torch.long).to(self.device) # (B, t)
+		sampling_d = self.sampling_algo.sampling_d
 
 		# get state and condition vector - only need to do this once
 		state_features = self.state_extractor(history)
 		if len(state_features.shape) == 1:
 			state_features = state_features[None, :]
 
-		# get diffusion params
-		betas, alphas, alpha_hats = get_diffusion_parameters(self.T)
+		if sampling_d is not None and self.step_size_extractor is not None:
+			step_size_features = self.step_size_extractor(sampling_d)
+		else:
+			step_size_features = None
 
 		# generate ---------------------------------------------------------------
 		# start with random noise, x
 		if self.channels_are_actions:
-			x = torch.randn((1,self.action_sequence_length,self.action_size))
+			x = torch.randn((E,self.action_sequence_length,self.action_size))
 		else:
-			x = torch.randn((1,self.action_size,self.action_sequence_length))
+			x = torch.randn((E,self.action_size,self.action_sequence_length))
 		x = x.to(torch.float32).to(self.device)
 
 		with torch.no_grad():
@@ -126,34 +152,14 @@ class DiffusionPolicy():
 				time_features = self.time_extractor(t)
 				if len(time_features.shape) == 1:
 					time_features = time_features[None, :]
-
-				# added noise (only for non-implicit)
-				z = torch.randn(*x.shape).to(torch.float32).to(self.device)
-				if t == 0:
-					z *= 0
-
-				# get params for this step
-				beta = betas[t]
-				alpha = alphas[t]
-				alphahat = alpha_hats[t]
+				if E>1:
+					time_features = time_features.repeat(E,1)
 
 				# predict the noise
-				pred_noise = self.model(x, time_features, state_features)
+				pred_noise = self.model(x, time_features, state_features, d=step_size_features)
 
-				if self.implicit:
-					# DDIM uses alphaHAT but calls it alpha
-					# I am redefining alpha to be alpha_hat here
-					alpha = alphahat
-					alphas = alpha_hats
-
-					atm1 = alphas[t-self.time_sampling_factor] if t>0 else 1.0
-
-					pred_x0 = (x - math.sqrt(1.0-alpha)*pred_noise)/math.sqrt(alpha)
-					point_xt = math.sqrt(1.0 - atm1)*pred_noise
-
-					x = math.sqrt(atm1)*pred_x0 + point_xt
-				else:
-					x = (1.0/math.sqrt(alpha))*(x - ((1.0 - alpha)/math.sqrt(1.0 - alphahat))*pred_noise) + math.sqrt(beta)*z
+				# backwards diffusion
+				x = self.sampling_algo.generation(x, t, pred_noise)
 
 		# convert output to numpy
 		x = x.data.cpu().numpy()
@@ -163,8 +169,7 @@ class DiffusionPolicy():
 		if self.clip is not None:
 			x = np.clip(x, self.clip[0], self.clip[1])
 
-		x = x[0]
-		x = x[:self.action_sequence_length//2]
+		x = x[:,:self.action_sequence_length//2]
 
 		self.current_trajectory = x
 

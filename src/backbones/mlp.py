@@ -20,7 +20,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 '''
 
 '''
-MLP Backbone for diffusion. 
+MLP Backbone for diffusion. Not recommended except for toy problems.
 '''
 
 import torch
