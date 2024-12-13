@@ -128,3 +128,17 @@ class TimeFeatures(torch.nn.Module):
 		x = self.pos_emb(x)
 		x = swish(self.fc1(x))
 		return x
+
+
+# Embed step size and pass through one hidden layer
+class StepSizeFeatures(torch.nn.Module):
+	def __init__(self, options=8, feature_size=256):
+		super().__init__()
+		self.pos_emb = PositionalEncoding(feature_size, options)
+		self.fc1 = torch.nn.Linear(feature_size, feature_size)
+
+	def forward(self, x):
+		x = self.pos_emb(x)
+		x = swish(self.fc1(x))
+		return x
+

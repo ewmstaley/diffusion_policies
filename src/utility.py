@@ -54,3 +54,17 @@ def cosine_lr_scheduler(opt, total_steps, warmup_steps, final=0.001):
 
     return scheduler
 
+
+# given a setting for d in a shortcut model,
+# only sample ts that can be reached under this setting
+def sample_ts_by_ds(ds, tmax=128):
+    ts = []
+    for d in ds:
+        stepsize = np.pow(2, d)
+        options = np.arange(0, tmax, stepsize)[:-1] 
+        # NOTE: we take off the last one since we need to be able to take two steps
+
+        t = np.random.choice(options)
+        ts.append(t)
+    return np.array(ts)
+

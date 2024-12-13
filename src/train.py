@@ -20,7 +20,8 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 '''
 
 '''
-Train a diffusion policy on expert data.
+Train a diffusion policy or flow matching model on expert data.
+Use train_shortcut.py to create a shortcut model.
 '''
 
 import torch
@@ -38,34 +39,34 @@ from box import Box
 import yaml
 import glob
 from buffer import TrajectoryBuffer
-from conditional_features import StateVectorFeatures, CNNFeatures, TimeFeatures
+from conditional_features import StateVectorFeatures, CNNFeatures, TimeFeatures, StepSizeFeatures
 from itertools import chain
 from torch.utils.tensorboard import SummaryWriter
 from policy import DiffusionPolicy
 from environment import make_car_racing, episode_with_dp
+from algos import DDPMAlgo, DDIMAlgo, FlowMatchingAlgo, FlowMatchingQuadraticAlgo
 
-
-
-# =====================================================
-# some configuration
 
 cfg = Box()
-
+# =====================================================
 cfg.BACKBONE = "UNET"
+cfg.ALGO = "FLOW" # one of [DDPM, DDIM, FLOW]
+cfg.SHORTCUT = False # always False for this script.
+cfg.STEP_SIZE = 20 # during deployment, how many out of T will be used each step? Can override later.
 cfg.ACTION_SIZE = 3
-cfg.STATE_SHAPE = (96,96,3)
+cfg.STATE_SHAPE = (96,96,3) # TODO: support vector states more fully
 cfg.STATE_HISTORY = 4
-cfg.NUM_ACTIONS = 8
-cfg.CHANNELS_ARE_ACTIONS = False
+cfg.NUM_ACTIONS = 8 # how many actions will be generated (only half will be used in deployment)
+cfg.CHANNELS_ARE_ACTIONS = False # recommend to use False here
 cfg.T = 1000
 cfg.BATCH_SIZE = 32
 cfg.EPOCHS = 1000
 cfg.ITERS_PER_EPOCH = 500
-cfg.EMA = True
-cfg.MIXED_PRECISION = False
-cfg.DTYPE = "bfloat16"
-cfg.OUTPUT_DIR = "./output/"
+cfg.EMA = True # very helpful
+cfg.OUTPUT_DIR = "./output_flow/"
 cfg.TESTING_MAXLEN = 1000
+cfg.K = 256 # used for both embedding sizes and number of channels
+cfg.MIXED_PRECISION = False # no longer supporting this for readability, and I never needed it.
 # =====================================================
 
 if not os.path.exists(cfg.OUTPUT_DIR):
@@ -73,7 +74,9 @@ if not os.path.exists(cfg.OUTPUT_DIR):
 
 # save config
 with open(cfg.OUTPUT_DIR+'config.yml', 'w') as outfile:
-    yaml.dump(cfg.to_dict(), outfile)
+    d = cfg.to_dict()
+    d["STATE_SHAPE"] = list(d["STATE_SHAPE"]) # avoid annoying yaml error with tuples
+    yaml.dump(d, outfile)
 
 # get data loaded in nice format
 buffer = TrajectoryBuffer(
@@ -81,7 +84,7 @@ buffer = TrajectoryBuffer(
     sequence_length=cfg.STATE_HISTORY+cfg.NUM_ACTIONS-1
 )
 
-# -- car racing data -- #
+# -- car racing -- #
 for f in glob.glob("../data_collect/excellent_runs/*.p"):
     print(f)
     tuples, reward, length = pickle.load( open( f, "rb" ) )
@@ -98,31 +101,41 @@ for f in glob.glob("../data_collect/excellent_runs/*.p"):
 
 
 # =====================================================
-# set up our models. We actually have six models happening:
-# the time feature extractor, the image state feature extractor, and the diffusion model
-#   these are all trained together
-# for each one, an EMA copy that keeps a running (weighted) average of the parameters.
+
+if cfg.ALGO == "DDPM":
+    algo = DDPMAlgo(cfg.T)
+elif cfg.ALGO == "DDIM":
+    algo = DDIMAlgo(cfg.T, cfg.STEP_SIZE)
+elif cfg.ALGO == "FLOW":
+    algo = FlowMatchingAlgo(cfg.T, cfg.STEP_SIZE)
+elif cfg.ALGO == "FLOWQ":
+    algo = FlowMatchingQuadraticAlgo(cfg.T, cfg.STEP_SIZE)
+else:
+    raise ValueError("cfg.ALGO must be one of [DDPM, DDIM, FLOW]")
+
+# =====================================================
 
 device = torch.device("cuda")
 
 # set up feature extractors
 if len(cfg.STATE_SHAPE) == 3:
     state_extractor = CNNFeatures(initial_side=cfg.STATE_SHAPE[0], initial_channels=cfg.STATE_SHAPE[-1]*cfg.STATE_HISTORY, 
-        layers=4, channels=48, feature_size=256).to(device)
+        layers=4, channels=48, feature_size=cfg.K).to(device)
 else:
-    state_extractor = StateVectorFeatures(initial_size=cfg.STATE_SHAPE[0]*cfg.STATE_HISTORY, feature_size=256).to(device)
+    state_extractor = StateVectorFeatures(initial_size=cfg.STATE_SHAPE[0]*cfg.STATE_HISTORY, feature_size=cfg.K).to(device)
 
-time_extractor = TimeFeatures(times=cfg.T, feature_size=256).to(device)
+time_extractor = TimeFeatures(times=cfg.T, feature_size=cfg.K).to(device)
 
+# currently only support UNET, but this is a good spot to add other backbones later
 if cfg.BACKBONE == "MLP":
     pass
 elif cfg.BACKBONE == "UNET":
     model = UNetBackbone(
         action_size = cfg.ACTION_SIZE, 
         action_sequence_length = cfg.NUM_ACTIONS, 
-        time_condition_dimension = 256, 
-        states_condition_dimension = 256, 
-        filters = [256, 256, 256, 256],
+        time_condition_dimension = cfg.K, 
+        states_condition_dimension = cfg.K, 
+        filters = [cfg.K, cfg.K, cfg.K, cfg.K],
         pools = [True, True, False],
         channels_are_actions = cfg.CHANNELS_ARE_ACTIONS
     ).to(device)
@@ -155,34 +168,6 @@ print("Backbone has", f'{backbone_params:,}', "parameters.")
 print("---")
 
 # =====================================================
-
-# set up a testing environment
-env = make_car_racing(cfg.STATE_SHAPE[0])
-
-# set up policy, for testing
-policy = DiffusionPolicy(
-    state_shape=cfg.STATE_SHAPE,
-    action_size=cfg.ACTION_SIZE, 
-    model=ema_model if cfg.EMA else model, 
-    state_extractor=ema_state_extractor if cfg.EMA else state_extractor, 
-    time_extractor=ema_time_extractor if cfg.EMA else time_extractor, 
-    device=device, 
-    T=cfg.T,
-    history_size=cfg.STATE_HISTORY, 
-    action_sequence_length=cfg.NUM_ACTIONS, 
-    implicit=True, 
-    sampling_factor=20,
-    channels_are_actions=cfg.CHANNELS_ARE_ACTIONS,
-    clip = [np.array([-1.0, 0.0, 0.0]), np.array([1.0, 1.0, 1.0])]
-)
-
-# =====================================================
-
-# pre-calculate coefficients as a function of time t
-betas, alphas, alpha_hats = get_diffusion_parameters(cfg.T)
-
-# =====================================================
-# training loop
 
 logger = SummaryWriter(log_dir=cfg.OUTPUT_DIR)
 
@@ -219,47 +204,26 @@ for epoch in range(cfg.EPOCHS):
             targets = np.transpose(targets, (0,2,1)) # (B, seq, A)
         targets = torch.from_numpy(targets).to(torch.float32).to(device)
 
-        # also sample noise, times, and alpha_hats
+        # also sample noise, times, and alpha_hats -----------------------
         e = torch.randn(*targets.shape).to(torch.float32).to(device)
         t = np.random.randint(0, cfg.T, size=(B,))
-        ahat = alpha_hats[t]
         t = torch.as_tensor(t).to(torch.long).to(device)
-        ahat = torch.as_tensor(ahat).to(torch.float32).to(device)
 
-        if cfg.CHANNELS_ARE_ACTIONS:
-            ahat = ahat.unsqueeze(1).unsqueeze(2).repeat(1,cfg.NUM_ACTIONS,cfg.ACTION_SIZE)
-        else:
-            ahat = ahat.unsqueeze(1).unsqueeze(2).repeat(1,cfg.ACTION_SIZE,cfg.NUM_ACTIONS)
+        # train ============================================================
+        # get the conditioning features
+        state_features = state_extractor(history)
+        time_features = time_extractor(t)
 
-        if cfg.MIXED_PRECISION:
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        # forward diffusion process
+        noised_batch, training_target = algo.forward_diffusion(targets, e, t)
 
-                # get the conditioning features
-                state_features = state_extractor(history)
-                time_features = time_extractor(t)
+        # main pass
+        predicted_noise = model(noised_batch, time_features, state_features)
+        loss = torch.nn.functional.mse_loss(predicted_noise, training_target)
+        loss.backward()
 
-                # get the noised targets
-                noised_batch = torch.sqrt(ahat)*targets + torch.sqrt(1.0 - ahat)*e
-
-                # main pass
-                predicted_noise = model(noised_batch, time_features, state_features)
-                loss = torch.nn.functional.mse_loss(predicted_noise, e)
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-            scaler.step(opt)
-            scaler.update()
-
-        else:
-            state_features = state_extractor(history)
-            time_features = time_extractor(t)
-            noised_batch = torch.sqrt(ahat)*targets + torch.sqrt(1.0 - ahat)*e
-            predicted_noise = model(noised_batch, time_features, state_features)
-            loss = torch.nn.functional.mse_loss(predicted_noise, e)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-            opt.step()
+        torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+        opt.step()
 
         if not math.isnan(loss.item()):
             epoch_losses.append(loss.item())
@@ -293,13 +257,3 @@ for epoch in range(cfg.EPOCHS):
 
         best_loss = final_loss
         print("New best model saved.")
-
-    # test on environment periodically
-    if (epoch+1)%50 == 0:
-        rewards = []
-        for i in range(10):
-            r, length = episode_with_dp(env, policy, maxlen=cfg.TESTING_MAXLEN, renders=True)
-            rewards.append(r)
-            print("    Episode Result:", r)
-        print("Average Return:", np.mean(rewards))
-        logger.add_scalar("reward", np.mean(rewards), global_step=epoch)

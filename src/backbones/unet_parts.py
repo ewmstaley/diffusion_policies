@@ -28,8 +28,8 @@ import torch
 def swish(x):
 	return x*torch.nn.functional.sigmoid(x)
 
+
 # stolen and then edited from: https://pytorch.org/tutorials/beginner/translation_transformer.html
-# TODO: I think this is duplicated in the conditional features file...
 class PositionalEncoding(torch.nn.Module):
     def __init__(self, d_model, embeddings=1000):
         super(PositionalEncoding, self).__init__()
@@ -46,7 +46,6 @@ class PositionalEncoding(torch.nn.Module):
 
 
 # block that computes queries, keys, and values for a sequence of vectors and the applies MHA
-# currently unused
 class AttentionBlock(torch.nn.Module):
 	def __init__(self, in_features):
 		super().__init__()
@@ -67,7 +66,7 @@ Takes as input x:(B,in_ch,size), time embedding: (B, t), state condition: (B, s)
 Outputs (B, out_ch, size).
 '''
 class ResConvBlock(torch.nn.Module):
-	def __init__(self, in_channels, out_channels, time_dim, condition_dim, has_attention=False):
+	def __init__(self, in_channels, out_channels, time_dim, condition_dim, has_attention=False, **kwargs):
 		super().__init__()
 		self.norm1 = torch.nn.GroupNorm(in_channels//4, in_channels)
 		self.conv1 = torch.nn.Conv1d(in_channels, out_channels, 3, 1, padding="same")
@@ -92,7 +91,7 @@ class ResConvBlock(torch.nn.Module):
 
 		self.cond_layer = torch.nn.Linear(condition_dim, out_channels)
 
-	def forward(self, x, t_emb, cond):
+	def forward(self, x, t_emb, cond, **kwargs):
 		# first conv
 		y = swish(self.norm1(x))
 		y = self.conv1(y)
@@ -138,7 +137,7 @@ The content before pooling is saved and concatenated to the data post-upsampling
 for us if we use several of these blocks.
 '''
 class UNetPair(torch.nn.Module):
-	def __init__(self, in_channels, out_channels, time_dim, condition_dim, has_attention=False, block_multiplier=1, pools=True):
+	def __init__(self, in_channels, out_channels, time_dim, condition_dim, has_attention=False, block_multiplier=1, pools=True, **kwargs):
 		super().__init__()
 		self.pools = pools
 		self.dconvs = torch.nn.ModuleList()
@@ -157,7 +156,7 @@ class UNetPair(torch.nn.Module):
 
 		self.connection = None
 
-	def down(self, x, t_emb, cond):
+	def down(self, x, t_emb, cond, **kwargs):
 		for dconv in self.dconvs:
 			x = dconv(x, t_emb, cond)
 		self.connection = x
@@ -165,7 +164,7 @@ class UNetPair(torch.nn.Module):
 			x = self.pool(x)
 		return x
 
-	def up(self, x, t_emb, cond):
+	def up(self, x, t_emb, cond, **kwargs):
 		if self.pools:
 			x = self.upsampler(x)
 		x = torch.cat((x,self.connection), dim=1) # concat channels
